@@ -8,7 +8,6 @@ cms/.netlify/
 # dependencies
 node_modules/
 cms
-
 scripts
 # logs
 npm-debug.log*
