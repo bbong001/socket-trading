@@ -1,11 +1,19 @@
 import { createServer } from 'http';
 import { Server } from 'socket.io';
-import { PrismaClient } from '@prisma/client';
-import { Pool } from 'pg';
+// Load environment variables from config.env (instead of relying on shell)
+import dotenv from 'dotenv';
+// Prisma Client is generated as CommonJS; use default import then destructure
+import prismaPackage from '@prisma/client';
+import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 
+dotenv.config({ path: 'config.env' });
+
+const { PrismaClient } = prismaPackage;
+const { Pool } = pg;
+
 // Use the same database URL as in src/server/prisma.ts
-const databaseUrl = process.env.DATABASE_URL
+const databaseUrl = process.env.DATABASE_URL;
 
 if (!databaseUrl) {
   console.error('DATABASE_URL is not set');
@@ -144,6 +152,7 @@ io.on('connection', (socket) => {
 
       console.log('Received send-message:', { conversationId, senderId, senderType, hasContent: !!content, hasImage: !!imageUrl });
 
+      // Basic payload validation only – no DB writes here
       if (!conversationId || senderType === undefined) {
         socket.emit('error', { message: 'Missing required fields: conversationId or senderType' });
         console.error('Missing required fields:', { conversationId, senderType });
@@ -157,74 +166,25 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Verify conversation exists
-      let conversation;
-      try {
-        conversation = await prisma.conversation.findUnique({
-          where: { id: conversationId },
-          select: { userId: true },
-        });
-      } catch (dbError) {
-        console.error('Database error in send-message:', dbError);
-        // Check if it's a connection error
-        if (dbError.code === 'ECONNREFUSED' || dbError.message?.includes('connect')) {
-          console.error('Database connection failed. Please check database URL and connection.');
-          socket.emit('error', { message: 'Database connection error. Please try again later.' });
-          return;
-        }
-        throw dbError;
-      }
-
-      if (!conversation) {
-        socket.emit('error', { message: 'Conversation not found' });
-        return;
-      }
-
-      // If sender is user (not admin), verify ownership
-      if (senderType === 'user' && conversation.userId !== senderId) {
-        socket.emit('error', { message: 'Access denied. This conversation does not belong to you.' });
-        return;
-      }
-
       // Admin (senderId=0 or senderType='admin') can send to any conversation
       // For admin, use senderId = 0 if not provided
       const finalSenderId = senderType === 'admin' ? (senderId || 0) : senderId;
 
-      console.log('Saving message to database:', { conversationId, senderId: finalSenderId, senderType, hasContent: !!content, hasImage: !!imageUrl });
-
-      // Save message to database
-      let message;
-      try {
-        message = await prisma.message.create({
-          data: {
-            conversationId,
-            senderId: finalSenderId,
-            senderType,
-            content: content || null,
-            imageUrl: imageUrl || null,
-          },
-        });
-        console.log('Message saved to database successfully:', message.id);
-      } catch (dbError) {
-        console.error('Database error saving message:', dbError);
-        socket.emit('error', { message: 'Failed to save message to database', error: dbError.message });
-        return;
-      }
-
-      // Update conversation lastMessageAt
-      try {
-        await prisma.conversation.update({
-          where: { id: conversationId },
-          data: { lastMessageAt: new Date() },
-        });
-        console.log('Conversation lastMessageAt updated');
-      } catch (updateError) {
-        console.error('Error updating conversation lastMessageAt:', updateError);
-        // Don't fail the whole operation if this fails
-      }
+      // Build message payload used for realtime only.
+      // Astro API /api/chat/messages is responsible for creating the real DB record.
+      const nowIso = new Date().toISOString();
+      const messagePayload = {
+        id: data.id ?? null,
+        conversationId,
+        senderId: finalSenderId,
+        senderType,
+        content: content || null,
+        imageUrl: imageUrl || null,
+        createdAt: data.createdAt || nowIso,
+        isRead: data.isRead ?? false,
+      };
 
       // Emit to all clients in the conversation room with conversationId
-      const messageWithConvId = { ...message, conversationId };
       const roomName = `conversation-${conversationId}`;
       
       // Get list of sockets in the room for debugging
@@ -232,32 +192,18 @@ io.on('connection', (socket) => {
       const roomSize = room ? room.size : 0;
       console.log(`Emitting new-message to room ${roomName}, room size: ${roomSize}, senderType: ${senderType}`);
       
-      io.to(roomName).emit('new-message', messageWithConvId);
+      io.to(roomName).emit('new-message', messagePayload);
 
       // Emit notification to admin if message is from user
       if (senderType === 'user') {
         io.emit('admin-notification', {
           type: 'new-message',
           conversationId,
-          message: messageWithConvId,
+          message: messagePayload,
         });
       }
       
-      // Also emit a user notification if message is from admin (for backward compatibility)
-      if (senderType === 'admin') {
-        // Find the user's socket and emit directly to them
-        // This ensures the message is delivered even if room join failed
-        const conversation = await prisma.conversation.findUnique({
-          where: { id: conversationId },
-          select: { userId: true },
-        });
-        if (conversation) {
-          // Emit to all sockets (user should be in the room, but this is a fallback)
-          console.log(`Admin message sent, also emitting user-notification for user ${conversation.userId}`);
-        }
-      }
-      // Note: user-notification is redundant since new-message already broadcasts to conversation room
-      // Removed to prevent duplicate messages
+      // Note: new-message already broadcasts to conversation room for both user/admin
     } catch (error) {
       console.error('Error sending message:', error);
       console.error('Error details:', {
@@ -273,25 +219,20 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Mark messages as read
-  socket.on('mark-read', async (data) => {
+  // Mark messages as read (realtime only – DB updates handled by Astro API)
+  socket.on('mark-read', (data) => {
     try {
       const { conversationId, senderType } = data;
 
-      await prisma.message.updateMany({
-        where: {
-          conversationId,
-          senderType: senderType === 'user' ? 'admin' : 'user',
-          isRead: false,
-        },
-        data: {
-          isRead: true,
-        },
-      });
+      if (!conversationId || !senderType) {
+        socket.emit('error', { message: 'Missing required fields: conversationId or senderType' });
+        console.error('Missing required fields in mark-read:', { conversationId, senderType });
+        return;
+      }
 
-      io.to(`conversation-${conversationId}`).emit('messages-read', { conversationId });
+      io.to(`conversation-${conversationId}`).emit('messages-read', { conversationId, senderType });
     } catch (error) {
-      console.error('Error marking messages as read:', error);
+      console.error('Error handling mark-read:', error);
     }
   });
 
